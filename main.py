@@ -14,6 +14,7 @@ patient_file_path = "fhir_data/patient/Patient.ndjson"
 med_admin_path = "fhir_data/medication_administration/MedicationAdministration.ndjson"
 med_request_path = "fhir_data/medication_request/MedicationRequest.ndjson"
 editable_profile_path = "editable_profile.json"
+user_accounts_path = "app_data/user_accounts.json"  # Added path for user accounts
 
 # Define help section function
 def help_section():
@@ -49,11 +50,37 @@ def help_section():
     st.markdown("## 📞 Contact & Support")
     st.info("For further assistance, email us at **support@medtracker.com** or call **+1-800-123-4567**.")
 
+# Load user accounts
+@st.cache_data
+def load_user_accounts():
+    try:
+        with open(user_accounts_path, "r") as file:
+            return json.load(file)
+    except Exception as e:
+        st.error(f"Error loading user accounts: {e}")
+        return []
+
 # Load patient
 @st.cache_data
-def load_patient():
-    with open(patient_file_path, "r") as file:
-        return json.loads(file.readline())
+def load_patient(patient_id=None):
+    try:
+        with open(patient_file_path, "r") as file:
+            patient_data = json.loads(file.readline())
+            # If a specific patient ID is provided, try to load that patient instead
+            if patient_id:
+                # Reset file pointer and search for the patient with matching ID
+                file.seek(0)
+                for line in file:
+                    try:
+                        patient = json.loads(line)
+                        if patient.get("id") == patient_id:
+                            return patient
+                    except:
+                        continue
+            return patient_data
+    except Exception as e:
+        st.error(f"Error loading patient data: {e}")
+        return {}
 
 # Load NDJSON
 def load_ndjson(path):
@@ -63,21 +90,254 @@ def load_ndjson(path):
     except:
         return []
 
-# Get initial profile from patient
-def get_initial_profile(p):
-    return {
-        "first_name": p['name'][0]['given'][0],
-        "last_name": p['name'][0]['family'],
-        "birth_date": p.get("birthDate", "N/A"),
-        "gender": p.get("gender", "unknown"),
-        "race": "",
-        "ethnicity": "",
-        "language": "",
-        "religion": "",
-        "address": p.get("address", [{}])[0].get("text", "N/A"),
-        "email": next((t['value'] for t in p.get("telecom", []) if t['system'] == "email"), "N/A"),
-        "phone": next((t['value'] for t in p.get("telecom", []) if t['system'] == "phone"), "N/A")
-    }
+# Convert editable profile back to FHIR format
+def update_fhir_patient(current_patient, profile_data):
+    # Create a copy of the current patient to avoid modifying the original
+    updated_patient = current_patient.copy()
+    
+    # Update name
+    if updated_patient.get("name") and len(updated_patient["name"]) > 0:
+        if profile_data.get("first_name"):
+            if "given" not in updated_patient["name"][0]:
+                updated_patient["name"][0]["given"] = []
+            
+            if len(updated_patient["name"][0]["given"]) > 0:
+                updated_patient["name"][0]["given"][0] = profile_data["first_name"]
+            else:
+                updated_patient["name"][0]["given"].append(profile_data["first_name"])
+        
+        if profile_data.get("last_name"):
+            updated_patient["name"][0]["family"] = profile_data["last_name"]
+    
+    # Update birthDate
+    if profile_data.get("birth_date") and profile_data["birth_date"] != "N/A":
+        updated_patient["birthDate"] = profile_data["birth_date"]
+    
+    # Update gender
+    if profile_data.get("gender") and profile_data["gender"] != "unknown":
+        updated_patient["gender"] = profile_data["gender"]
+    
+    # Update telecom (phone and email)
+    if "telecom" not in updated_patient:
+        updated_patient["telecom"] = []
+    
+    # Update phone
+    phone_found = False
+    for i, telecom in enumerate(updated_patient.get("telecom", [])):
+        if telecom.get("system") == "phone":
+            if profile_data.get("phone") and profile_data["phone"] != "N/A":
+                updated_patient["telecom"][i]["value"] = profile_data["phone"]
+            phone_found = True
+            break
+    
+    if not phone_found and profile_data.get("phone") and profile_data["phone"] != "N/A":
+        updated_patient["telecom"].append({
+            "system": "phone",
+            "value": profile_data["phone"],
+            "use": "home"
+        })
+    
+    # Update email
+    email_found = False
+    for i, telecom in enumerate(updated_patient.get("telecom", [])):
+        if telecom.get("system") == "email":
+            if profile_data.get("email") and profile_data["email"] != "N/A":
+                updated_patient["telecom"][i]["value"] = profile_data["email"]
+            email_found = True
+            break
+    
+    if not email_found and profile_data.get("email") and profile_data["email"] != "N/A":
+        updated_patient["telecom"].append({
+            "system": "email",
+            "value": profile_data["email"],
+            "use": "home"
+        })
+    
+    # Update address
+    if profile_data.get("address") and profile_data["address"] != "N/A":
+        if "address" not in updated_patient or not updated_patient["address"]:
+            updated_patient["address"] = [{"text": profile_data["address"]}]
+        else:
+            updated_patient["address"][0]["text"] = profile_data["address"]
+    
+    # Update race
+    if profile_data.get("race"):
+        race_found = False
+        for i, extension in enumerate(updated_patient.get("extension", [])):
+            if extension.get("url") == "http://hl7.org/fhir/us/core/StructureDefinition/us-core-race":
+                race_found = True
+                for j, race_ext in enumerate(extension.get("extension", [])):
+                    if race_ext.get("url") == "text":
+                        updated_patient["extension"][i]["extension"][j]["valueString"] = profile_data["race"]
+                        break
+                break
+        
+        if not race_found:
+            if "extension" not in updated_patient:
+                updated_patient["extension"] = []
+            updated_patient["extension"].append({
+                "url": "http://hl7.org/fhir/us/core/StructureDefinition/us-core-race",
+                "extension": [
+                    {
+                        "url": "text",
+                        "valueString": profile_data["race"]
+                    }
+                ]
+            })
+    
+    # Update ethnicity
+    if profile_data.get("ethnicity"):
+        ethnicity_found = False
+        for i, extension in enumerate(updated_patient.get("extension", [])):
+            if extension.get("url") == "http://hl7.org/fhir/us/core/StructureDefinition/us-core-ethnicity":
+                ethnicity_found = True
+                for j, eth_ext in enumerate(extension.get("extension", [])):
+                    if eth_ext.get("url") == "text":
+                        updated_patient["extension"][i]["extension"][j]["valueString"] = profile_data["ethnicity"]
+                        break
+                break
+        
+        if not ethnicity_found:
+            if "extension" not in updated_patient:
+                updated_patient["extension"] = []
+            updated_patient["extension"].append({
+                "url": "http://hl7.org/fhir/us/core/StructureDefinition/us-core-ethnicity",
+                "extension": [
+                    {
+                        "url": "text",
+                        "valueString": profile_data["ethnicity"]
+                    }
+                ]
+            })
+    
+    # Update language
+    if profile_data.get("language"):
+        if "communication" not in updated_patient or not updated_patient["communication"]:
+            updated_patient["communication"] = [
+                {
+                    "language": {
+                        "text": profile_data["language"]
+                    }
+                }
+            ]
+        else:
+            if "language" not in updated_patient["communication"][0]:
+                updated_patient["communication"][0]["language"] = {}
+            updated_patient["communication"][0]["language"]["text"] = profile_data["language"]
+    
+    return updated_patient
+
+# Save patient data back to FHIR resource
+def save_patient_data(patient_data):
+    try:
+        patient_id = patient_data.get("id")
+        if not patient_id:
+            return False, "Invalid patient data: no patient ID found"
+        
+        # Read all patients from the file
+        all_patients = []
+        try:
+            with open(patient_file_path, "r") as file:
+                for line in file:
+                    try:
+                        p = json.loads(line)
+                        all_patients.append(p)
+                    except:
+                        continue
+        except Exception as e:
+            return False, f"Error reading patient file: {e}"
+        
+        # Find and update the patient
+        updated = False
+        for i, p in enumerate(all_patients):
+            if p.get("id") == patient_id:
+                all_patients[i] = patient_data
+                updated = True
+                break
+        
+        if not updated:
+            return False, f"Patient with ID {patient_id} not found"
+        
+        # Write all patients back to the file
+        try:
+            with open(patient_file_path, "w") as file:
+                for p in all_patients:
+                    file.write(json.dumps(p) + "\n")
+            return True, "Patient data updated successfully"
+        except Exception as e:
+            return False, f"Error writing to patient file: {e}"
+            
+    except Exception as e:
+        return False, f"Error saving patient data: {e}"
+
+# Get user profile from user_accounts.json and patient resource
+def get_user_profile(username):
+    user_accounts = load_user_accounts()
+    for user in user_accounts:
+        if user.get("username") == username:
+            patient_id = user.get("patient_id", "")
+            
+            # Create a basic profile with user account info
+            profile = {
+                "first_name": user.get("first_name", ""),
+                "last_name": user.get("last_name", ""),
+                "patient_id": patient_id,
+                # Add other profile fields with default values
+                "birth_date": "N/A",
+                "gender": "unknown",
+                "race": "",
+                "ethnicity": "",
+                "language": "",
+                "religion": "",
+                "address": "N/A",
+                "email": "N/A",
+                "phone": "N/A"
+            }
+            
+            # If we have a patient_id, try to get the actual patient data
+            if patient_id:
+                patient_data = load_patient(patient_id)
+                if patient_data:
+                    # Extract information from patient resource
+                    name = patient_data.get("name", [{}])[0]
+                    profile.update({
+                        "first_name": name.get("given", [""])[0] if name.get("given") else "",
+                        "last_name": name.get("family", ""),
+                        "birth_date": patient_data.get("birthDate", "N/A"),
+                        "gender": patient_data.get("gender", "unknown"),
+                        "address": patient_data.get("address", [{}])[0].get("text", 
+                                 " ".join(patient_data.get("address", [{}])[0].get("line", [""])) + 
+                                 ", " + patient_data.get("address", [{}])[0].get("city", "") +
+                                 ", " + patient_data.get("address", [{}])[0].get("state", "") +
+                                 " " + patient_data.get("address", [{}])[0].get("postalCode", "")
+                                 ) if patient_data.get("address") else "N/A",
+                        "phone": next((t.get("value", "N/A") for t in patient_data.get("telecom", []) 
+                                    if t.get("system") == "phone"), "N/A"),
+                        "email": next((t.get("value", "N/A") for t in patient_data.get("telecom", []) 
+                                    if t.get("system") == "email"), "N/A"),
+                    })
+                    
+                    # Extract race from extension
+                    for ext in patient_data.get("extension", []):
+                        if ext.get("url") == "http://hl7.org/fhir/us/core/StructureDefinition/us-core-race":
+                            for race_ext in ext.get("extension", []):
+                                if race_ext.get("url") == "text":
+                                    profile["race"] = race_ext.get("valueString", "")
+                        
+                        # Extract ethnicity from extension
+                        elif ext.get("url") == "http://hl7.org/fhir/us/core/StructureDefinition/us-core-ethnicity":
+                            for eth_ext in ext.get("extension", []):
+                                if eth_ext.get("url") == "text":
+                                    profile["ethnicity"] = eth_ext.get("valueString", "")
+                    
+                    # Extract language from communication
+                    if patient_data.get("communication"):
+                        for comm in patient_data.get("communication", []):
+                            if comm.get("language", {}).get("text"):
+                                profile["language"] = comm.get("language", {}).get("text", "")
+            
+            return profile
+    return None
 
 # Check if medication was taken today
 def was_medication_taken_today(med_id, administrations):
@@ -115,18 +375,41 @@ def was_medication_taken_today(med_id, administrations):
             
     return False
 
+# Authenticate user
+def authenticate(username, password):
+    user_accounts = load_user_accounts()
+    for user in user_accounts:
+        if user.get("username") == username and user.get("password") == password:
+            return True
+    return False
+
 # Load data
-patient = load_patient()
+patient = load_patient()  # Default patient data (will be replaced with specific patient after login)
 med_requests = load_ndjson(med_request_path)
 med_administrations = load_ndjson(med_admin_path)
 
 # Session state
+if "username" not in st.session_state:
+    st.session_state.username = None
+
+if "current_patient" not in st.session_state:
+    st.session_state.current_patient = None
+
 if "editable_profile" not in st.session_state:
-    try:
-        with open(editable_profile_path, "r") as f:
-            st.session_state.editable_profile = json.load(f)
-    except:
-        st.session_state.editable_profile = get_initial_profile(patient)
+    st.session_state.editable_profile = {
+        "first_name": "",
+        "last_name": "",
+        "birth_date": "N/A",
+        "gender": "unknown",
+        "race": "",
+        "ethnicity": "",
+        "language": "",
+        "religion": "",
+        "address": "N/A",
+        "email": "N/A",
+        "phone": "N/A",
+        "patient_id": ""
+    }
 
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = st.query_params.get("auth") == "true"
@@ -150,8 +433,23 @@ if not st.session_state.logged_in:
     username = st.text_input("Username")
     password = st.text_input("Password", type="password")
     if st.button("Login"):
-        if username == "tarunta" and password == "password123":
+        if authenticate(username, password):
             st.session_state.logged_in = True
+            st.session_state.username = username
+            
+            # Load user profile from user_accounts.json and patient resource
+            user_profile = get_user_profile(username)
+            if user_profile:
+                st.session_state.editable_profile = user_profile
+                
+                # Update the patient data based on the patient_id
+                if user_profile.get("patient_id"):
+                    patient_data = load_patient(user_profile.get("patient_id"))
+                    if patient_data:
+                        st.session_state.current_patient = patient_data
+                    else:
+                        st.warning("Patient data not found. Some features may be limited.")
+                
             st.query_params.update({"auth": "true"})
             st.rerun()
         else:
@@ -160,6 +458,7 @@ if not st.session_state.logged_in:
 
 if st.button("Logout"):
     st.session_state.logged_in = False
+    st.session_state.username = None
     st.query_params.clear()
     st.rerun()
 
@@ -234,23 +533,41 @@ with home:
             port = 587
             from_email = 'cs6440medicationtracker@gmail.com'
             to_email = 'ramongored@gmail.com'
-            password = 'nobn kuta ecgz dkti'  
-            
-            message = """Subject: Mail sent using python
-            
-            Hi,
-            
-            Please check your medications.
-            """
+            password = 'nobn kuta ecgz dkti'
+
+            # --- Construct message ---
+            not_taken = [
+                f"- {med['Medication']} ({med['Dosage']})"
+                for med in active_medications
+                if not st.session_state.taken_medications.get(med["RXnormCode"] or med["Medication"], False)
+            ]
+
+            if not_taken:
+                med_list = "\n".join(not_taken)
+                med_text = f"The following medications still need to be taken today:\n\n{med_list}"
+            else:
+                med_text = "All medications have been taken today. Great job!"
+
+            message = f"""Subject: Medication Reminder
+
+    Hi {st.session_state.editable_profile['first_name']},
+
+    {med_text}
+
+    - Medication Tracker App
+    """
+
+            # --- Send ---
             smtp = smtplib.SMTP(host, port)
             smtp.ehlo()
             smtp.starttls()
             smtp.login(from_email, password)
             smtp.sendmail(from_email, to_email, message)
             smtp.quit()
-            return "Email sent successfully!"
+            return "✅ Email sent successfully!"
         except Exception as e:
-            return f"Error: {e}"
+            return f"❌ Error sending email: {e}"
+
 
     st.subheader("\u2705 Mark Active Medications as Administered")
     
@@ -297,7 +614,7 @@ with home:
                     ],
                     "text": med["Medication"]
                 },
-                "subject": med["Original"].get("subject", {"reference": f"Patient/{patient['id']}"}),
+                "subject": med["Original"].get("subject", {"reference": f"Patient/{st.session_state.editable_profile.get('patient_id', '')}"}),
                 "context": med["Original"].get("encounter", {"reference": f"Encounter/{str(uuid.uuid4())}"}),
                 "effectiveDateTime": datetime.now().isoformat(),
                 "reasonCode": med["Original"].get("reasonCode", [
@@ -382,9 +699,21 @@ with analytics:
 # Profile
 with profile:
     if st.button("💾 Save Profile"):
-        with open(editable_profile_path, "w") as f:
-            json.dump(st.session_state.editable_profile, f, indent=2)
-        st.success("Profile saved successfully.")
+        if st.session_state.current_patient:
+            # Convert editable profile back to FHIR format
+            updated_patient = update_fhir_patient(st.session_state.current_patient, st.session_state.editable_profile)
+            
+            # Save updated FHIR resource
+            success, message = save_patient_data(updated_patient)
+            
+            if success:
+                # Update the session state with the new FHIR data
+                st.session_state.current_patient = updated_patient
+                st.success("Patient FHIR resource updated successfully.")
+            else:
+                st.error(f"Error saving patient data: {message}")
+        else:
+            st.error("No patient resource found to update.")
 
     tabs = st.tabs(["Personal Information", "Contact Information", "Conditions", "Immunizations", "Allergies", "Family Contacts"])
     with tabs[0]:
